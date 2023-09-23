@@ -226,15 +226,14 @@ class OpenTelemetryPlugin:
             self.fixture_teardown_span = tracer.start_span("fixture teardown")
             return
 
-        # If a fixture is requested by more than one function it will
-        # technically get torn down once per function, even though it may not
-        # actually do anything substantive after the first. For function
-        # scoped fixtures, it will be obvious what test function requested
-        # the fixture based on the span, but for higher scoped functions,
-        # include which fixture it was for in the name.
+        # If the fixture has already been torn down, then it will have no cached result.
+        # and we can skip this one. Create a new span for the next one.
+        if fixturedef.cached_result is None:
+            yield
+            self.fixture_teardown_span = tracer.start_span("fixture teardown")
+            return
+
         name = f"{fixturedef.argname} teardown"
-        if fixturedef.scope != "function":
-            name += f" for {request._pyfuncitem.nodeid}"
         self.fixture_teardown_span.update_name(name)
 
         attributes: Dict[str, Union[str, int]] = {
