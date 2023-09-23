@@ -1,8 +1,15 @@
 import os
+from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Union
 
 import pytest
 from _pytest.config import Config
+from _pytest.fixtures import (
+    FixtureDef,
+    SubRequest,
+    getfslineno,
+    resolve_fixture_function,
+)
 from _pytest.main import Session
 from _pytest.nodes import Item, Node
 from _pytest.reports import TestReport
@@ -107,6 +114,150 @@ class OpenTelemetryPlugin:
             item.name, attributes=attributes, context=context
         ):
             yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_setup(self, item: Item) -> Generator[None, None, None]:
+        filepath, line_number, _ = item.location
+        attributes: Dict[str, Union[str, int]] = {
+            SpanAttributes.CODE_FILEPATH: filepath,
+            SpanAttributes.CODE_FUNCTION: item.name,
+            "pytest.nodeid": item.nodeid,
+            PYTEST_SPAN_TYPE: "test setup",
+        }
+        # In some cases like tavern, line_number can be 0
+        if line_number:
+            attributes[SpanAttributes.CODE_LINENO] = line_number
+        with tracer.start_as_current_span(
+            f"{item.name} setup",
+            attributes=attributes,
+        ):
+            yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item: Item) -> Generator[None, None, None]:
+        filepath, line_number, _ = item.location
+        attributes: Dict[str, Union[str, int]] = {
+            SpanAttributes.CODE_FILEPATH: filepath,
+            SpanAttributes.CODE_FUNCTION: item.name,
+            "pytest.nodeid": item.nodeid,
+            PYTEST_SPAN_TYPE: "test call",
+        }
+        # In some cases like tavern, line_number can be 0
+        if line_number:
+            attributes[SpanAttributes.CODE_LINENO] = line_number
+        with tracer.start_as_current_span(
+            f"{item.name} call",
+            attributes=attributes,
+        ):
+            yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_teardown(self, item: Item) -> Generator[None, None, None]:
+        filepath, line_number, _ = item.location
+        attributes: Dict[str, Union[str, int]] = {
+            SpanAttributes.CODE_FILEPATH: filepath,
+            SpanAttributes.CODE_FUNCTION: item.name,
+            "pytest.nodeid": item.nodeid,
+            PYTEST_SPAN_TYPE: "test teardown",
+        }
+        # In some cases like tavern, line_number can be 0
+        if line_number:
+            attributes[SpanAttributes.CODE_LINENO] = line_number
+        with tracer.start_as_current_span(
+            f"{item.name} teardown",
+            attributes=attributes,
+        ):
+            # Since there is no pytest_fixture_teardown hook, we have to be a
+            # little clever to capture the spans for each fixture's teardown.
+            # The pytest_fixture_post_finalizer hook is called at the end of a
+            # fixture's teardown, but we don't know when the fixture actually
+            # began tearing down.
+            #
+            # Instead start a span here for the first fixture to be torn down,
+            # but give it a temporary name, since we don't know which fixture it
+            # will be. Then, in pytest_fixture_post_finalizer, when we do know
+            # which fixture is being torn down, update the name and attributes
+            # to the actual fixture, end the span, and create the span for the
+            # next fixture in line to be torn down.
+            self.fixture_teardown_span = tracer.start_span("fixture teardown")
+            yield
+
+        # The last call to pytest_fixture_post_finalizer will create
+        # a span that is unneeded, so delete it.
+        del self.fixture_teardown_span
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_fixture_setup(
+        self, fixturedef: FixtureDef, request: SubRequest
+    ) -> Generator[None, None, None]:
+        attributes: Dict[str, Union[str, int]] = {
+            PYTEST_SPAN_TYPE: "fixture setup",
+        }
+
+        if fixturedef.has_location:
+            func = resolve_fixture_function(fixturedef, request)
+            filepath, line_number = getfslineno(func)
+            if Path(filepath).is_relative_to(request.config.rootpath):
+                filepath = Path(filepath).relative_to(request.config.rootpath)
+            attributes[SpanAttributes.CODE_FILEPATH] = str(filepath)
+
+            if line_number:  # pragma: no branch
+                attributes[SpanAttributes.CODE_LINENO] = line_number
+
+        with tracer.start_as_current_span(
+            f"{fixturedef.argname} setup",
+            attributes=attributes,
+        ):
+            yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_fixture_post_finalizer(
+        self, fixturedef: FixtureDef, request: SubRequest
+    ) -> Generator[None, None, None]:
+        """When the span for a fixture teardown is created by
+        pytest_runtest_teardown or a previous pytest_fixture_post_finalizer, we
+        need to update the name and attributes now that we know which fixture it
+        was for."""
+
+        # Passing `-x` option to pytest can cause it to exit early
+        # so it may not have this span attribute.
+        if not hasattr(self, 'fixture_teardown_span'):  # pragma: no cover
+            yield
+            self.fixture_teardown_span = tracer.start_span("fixture teardown")
+            return
+
+        # If a fixture is requested by more than one function it will
+        # technically get torn down once per function, even though it may not
+        # actually do anything substantive after the first. For function
+        # scoped fixtures, it will be obvious what test function requested
+        # the fixture based on the span, but for higher scoped functions,
+        # include which fixture it was for in the name.
+        name = f"{fixturedef.argname} teardown"
+        if fixturedef.scope != "function":
+            name += f" for {request._pyfuncitem.nodeid}"
+        self.fixture_teardown_span.update_name(name)
+
+        attributes: Dict[str, Union[str, int]] = {
+            PYTEST_SPAN_TYPE: "fixture teardown",
+        }
+        if fixturedef.has_location:
+            func = resolve_fixture_function(fixturedef, request)
+            filepath, line_number = getfslineno(func)
+
+            if Path(filepath).is_relative_to(request.config.rootpath):
+                filepath = Path(filepath).relative_to(request.config.rootpath)
+            attributes[SpanAttributes.CODE_FILEPATH] = str(filepath)
+
+            if line_number:  # pragma: no branch
+                attributes[SpanAttributes.CODE_LINENO] = line_number
+        self.fixture_teardown_span.set_attributes(attributes)
+        yield
+        self.fixture_teardown_span.end()
+
+        # Create the span for the next fixture to be torn down. When there are
+        # no more fixtures remaining, this will be an empty, useless span, so it
+        # needs to be deleted by pytest_runtest_teardown.
+        self.fixture_teardown_span = tracer.start_span("fixture teardown")
 
     @staticmethod
     def pytest_exception_interact(

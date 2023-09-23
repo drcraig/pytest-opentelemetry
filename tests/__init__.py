@@ -15,3 +15,7 @@ class SpanRecorder(InMemorySpanExporter):
     def spans_by_name(self) -> Dict[str, ReadableSpan]:
         """Returns a dictionary of remembered spans keyed by their names"""
         return {s.name: s for s in self.finished_spans()}
+
+    def span_names(self) -> Sequence[str]:
+        """Returns a list of span names. Names may not be unique."""
+        return [s.name for s in self.finished_spans()]
