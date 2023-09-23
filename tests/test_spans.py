@@ -467,8 +467,6 @@ def test_fixture_teardown_error(
             'test_one call',
             'test_one teardown',
             'fixture_b teardown',
-            # TODO: I don't understand why there is a second b teardown
-            'fixture_b teardown',
             'fixture_a teardown',
         ]
     )
